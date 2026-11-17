@@ -1,169 +1,53 @@
-import os
-import json
-from fastapi import FastAPI, UploadFile, File, Form
+from datetime import datetime, timedelta
+from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.responses import JSONResponse
-from google import genai
-from google.genai import types
+from pydantic import BaseModel
+from passlib.context import CryptContext
+from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
-from schema import TextRequest
+import jwt
+import os
 
-load_dotenv()  # Load environment variables from .env file
+load_dotenv()
 
-gemini_api_key = os.getenv("GEMINI_API_KEY")
-if not gemini_api_key:
-    raise ValueError("GEMINI_API_KEY is not set in the environment variables.")
+SECRET_KEY = os.getenv("SECRET_KEY")
+ALGORITHM = os.getenv("ALGORITHM")
+MONGO_URI = os.getenv("MONGO_URI")
 
-model = os.getenv("CHAT_MODEL")
-if not model:
-    raise ValueError("CHAT_MODEL is not set in the environment variables.")
+app = FastAPI()
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+client = AsyncIOMotorClient(MONGO_URI)
+user_collection = client.mydb.users
 
-app = FastAPI(
-    title="Module 1 - API Interaction of AI Tutor Project",
-    description="This API allows interaction with the Gemini API for generating text based on a given topic, course, and student level.",
-    version="1.0.0"
-)
+class User(BaseModel):
+    username: str
+    password: str
 
-ai_client = genai.Client(api_key=gemini_api_key)
+def create_access_token(data: dict):
+    return jwt.encode({**data, "exp": datetime.utcnow() + timedelta(minutes=30)}, SECRET_KEY, algorithm=ALGORITHM)
 
-# Text input to generate explanation for the topic, course, and student level
-@app.post("/generate_text")
-async def generate_explanation(request: TextRequest):
-    prompt = f"""
-    You are an AI tutor creating study material for a student.
-    Topic: "{request.topic}"
-    Subject: "{request.course or "Not specified"}"
-    Student level: "{request.student_level}"
-
-    Explain the topic clearly and accurately using language suited to the student.
-    Output a valid JSON response containing:
-    1. "topic": string
-    2. "lesson_content": string (clear explanation for study)
-    3. "key_terms": list of objects with "term" and "definition" strings
-    4. "example": string (a relevant example)
-    5. "practice_questions": list of 3 questions
-    """
-
+def get_current_user(token: str = Header(...)):
     try:
-        response = ai_client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.3,
-                response_mime_type="application/json"
-            )
-        )
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])["username"]
+    except Exception:
+        raise HTTPException(status_code=401, detail={"message": "Token Invalid or Expired"})
 
-        response_json = json.loads(response.text)
-        return JSONResponse(status_code=200, content=response_json)
-    
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+@app.post("/singup")
+async def signup(user: User):
+    if await user_collection.find_one({"username": user.username}):
+        raise HTTPException(status_code=400, detail={"message": "User Already Exist"})
+    hashed_password = pwd_context.hash(user.password)
+    await user_collection.insert_one({"username": user.username, "password": hashed_password})
+    return JSONResponse(status_code=200, content={"message": "User Registered"})
 
-# Academic Image Analysis and Explanation
-@app.post("/analyze_image")
-async def analyze_image(file: UploadFile = File(...), question: str = Form(...)):
-    if file.content_type not in ["image/jpeg", "image/png"]:
-        return JSONResponse(status_code=400, content={"error": "Invalid file type. Only JPEG and PNG are allowed."})
+@app.post("/singin")
+async def signin(user: User):
+    db_user = await user_collection.find_one({"username": user.username})
+    if not db_user or not pwd_context.verify(user.password, db_user["password"]):
+        raise HTTPException(status_code=401, detail={"message": "Invalid User"})
+    token = create_access_token({"username": user.username}) 
+    return JSONResponse(status_code=200, content={"access_token": token})
 
-    try:
-        image_bytes = await file.read()
-        image_input = types.Part.from_bytes(data=image_bytes, mime_type=file.content_type)
-
-        prompt = f"""
-        You are an AI tutor analyzing an academic image.
-        Question: "{question}"
-
-        Provide a clear and accurate explanation of the image in relation to the question.
-        Output a valid JSON response containing:
-        1. "image_analysis": string (detailed analysis of the image)
-        2. "key_points": list of strings (important points from the analysis)
-        3. "related_concepts": list of strings (concepts related to the image and question)
-        """
-
-        response = ai_client.models.generate_content(
-            model=model,
-            contents=[prompt, image_input],
-            config=types.GenerateContentConfig(
-                temperature=0.7,
-                response_mime_type="application/json"
-            )
-        )
-
-        response_json = json.loads(response.text)
-        return JSONResponse(status_code=200, content=response_json)
-
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-# Text Question and Audio Answer Evaluation
-@app.post("/evaluate_audio_answer")
-async def evaluate_audio_answer(file: UploadFile = File(...), question: str = Form(...)):
-    if file.content_type not in ["audio/mpeg", "audio/wav"]:
-        return JSONResponse(status_code=400, content={"error": "Invalid file type. Only MP3 and WAV are allowed."})
-
-    try:
-        audio_bytes = await file.read()
-        audio_input = types.Part.from_bytes(data=audio_bytes, mime_type=file.content_type)
-
-        prompt = f"""
-        You are an AI tutor evaluating a student's answer to a question.
-        Question: "{question}"
-
-        Evaluate the student's answer provided in the audio file.
-        Output a valid JSON response containing:
-        1. "evaluation": string (detailed evaluation of the answer)
-        2. "score": integer (score out of 10)
-        3. "feedback": string (constructive feedback for improvement)
-        """
-
-        response = ai_client.models.generate_content(
-            model=model,
-            contents=[prompt, audio_input],
-            config=types.GenerateContentConfig(
-                temperature=0.7,
-                response_mime_type="application/json"
-            )
-        )
-
-        response_json = json.loads(response.text)
-        return JSONResponse(status_code=200, content=response_json)
-    
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-# Video Analysis and Generate 3 MCQ Questions with options and answers
-@app.post("/analyze_video")
-async def analyze_video(file: UploadFile = File(...), question: str = Form(...)):
-    if file.content_type not in ["video/mp4", "video/avi"]:
-        return JSONResponse(status_code=400, content={"error": "Invalid file type. Only MP4 and AVI are allowed."})
-
-    try:
-        video_bytes = await file.read()
-        video_input = types.Part.from_bytes(data=video_bytes, mime_type=file.content_type)
-
-        prompt = f"""
-        You are an AI tutor analyzing an academic video.
-        Question: "{question}"
-
-        Provide a clear and accurate analysis of the video in relation to the question.
-        Generate 3 multiple-choice questions (MCQs) based on the video content, each with 4 options and the correct answer.
-        Output a valid JSON response containing:
-        1. "video_analysis": string (detailed analysis of the video)
-        2. "mcq_questions": list of objects with "question", "options" (list of strings), and "correct_answer" (string)
-        """
-
-        response = ai_client.models.generate_content(
-            model=model,
-            contents=[prompt, video_input],
-            config=types.GenerateContentConfig(
-                temperature=0.7,
-                response_mime_type="application/json"
-            )
-        )
-
-        response_json = json.loads(response.text)
-        return JSONResponse(status_code=200, content=response_json)
-    
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+@app.get("/protected")
+async def protected_route(username: str = Depends(get_current_user)):
+    return JSONResponse(status_code=200, content={"message": f"Hi {username}, welcome"})
